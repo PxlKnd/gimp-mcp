@@ -22,9 +22,10 @@ GIMP_HOST = 'localhost'
 GIMP_PORT = 9877
 
 class GimpConnection:
-    def __init__(self, host=GIMP_HOST, port=GIMP_PORT):
+    def __init__(self, host=GIMP_HOST, port=GIMP_PORT, timeout=10.0):
         self.host = host
         self.port = port
+        self.timeout = timeout
         self.sock = None
 
     def connect(self):
@@ -32,7 +33,7 @@ class GimpConnection:
             return
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.sock.settimeout(10)
+            self.sock.settimeout(self.timeout)
             self.sock.connect((self.host, self.port))
             logger.info(f"Connected to GIMP at {self.host}:{self.port}")
         except Exception as e:
@@ -651,6 +652,27 @@ def _resolve_rembg_bin(rembg_bin: str = "") -> Path:
     )
 
 
+def _wait_for_file_stable(path: str, max_wait: float = 90.0) -> bool:
+    """Wait until a file's size stops changing (a writer may still be active).
+
+    Returns True once the size has been unchanged for >1 s (and non-zero),
+    or False if the wait budget was exhausted.
+    """
+    last_size, last_change = -1, time.time()
+    deadline = time.time() + max_wait
+    while time.time() < deadline:
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            size = -1
+        if size != last_size:
+            last_size, last_change = size, time.time()
+        elif size > 0 and time.time() - last_change > 1.0:
+            return True
+        time.sleep(0.5)
+    return False
+
+
 @mcp.tool()
 def remove_background(
     ctx: Context,
@@ -698,22 +720,26 @@ def remove_background(
     try:
         conn = get_gimp_connection()
 
-        # 1) Export the current visible state of the image. Large exports can
-        #    exceed the 10 s socket timeout yet still succeed — fall back to
-        #    checking whether the file was written.
-        export_ok = False
+        # 1) Export the current visible state of the image. Large PNG exports
+        #    can exceed the default 10 s socket timeout, so this step uses a
+        #    dedicated long-timeout connection. If it still times out, GIMP
+        #    may have kept writing — wait for the file to stabilize before
+        #    handing it to rembg (avoid reading a truncated PNG).
         try:
-            result = conn.send_command("export_image", {
+            export_conn = GimpConnection(timeout=120.0)
+            result = export_conn.send_command("export_image", {
                 "file_path": src_png,
                 "format": "png",
                 "quality": 100,
                 "flatten": True,
                 "image_index": image_index,
             })
-            export_ok = result.get("status") == "success"
+            if result.get("status") != "success":
+                logger.warning(f"export_image reported: {result.get('error')}")
         except Exception as e:
-            logger.warning(f"export_image timed out ({e}) — checking file existence")
-        if not export_ok and not os.path.isfile(src_png):
+            logger.warning(f"export_image failed/timed out ({e}) — checking file state")
+            _wait_for_file_stable(src_png)
+        if not os.path.isfile(src_png) or os.path.getsize(src_png) == 0:
             raise Exception("could not export the image from GIMP — is an image open?")
 
         # 2) Run local AI matting via the rembg CLI
