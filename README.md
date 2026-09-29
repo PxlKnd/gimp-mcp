@@ -209,6 +209,39 @@ This enables iterative agentic workflows: **edit → snapshot → assess → ref
 #### `get_image_bitmap(image_index, max_width, max_height, region)`
 Lower-level bitmap fetch with region extraction and scaling. Returns base64-encoded PNG.
 
+### 🤖 AI Background Removal (optional)
+
+`remove_background(image_index, model, layer_name, rembg_bin)` runs neural-network
+matting **fully locally** via [rembg](https://github.com/danielgatis/rembg) (ONNX),
+then inserts the cutout as a new transparent layer — non-destructive, the original
+layers stay intact. Toggle the layer's visibility to compare.
+
+One-time install on the machine running the MCP server:
+
+```bash
+uv venv --python 3.13 ~/rembg-env
+uv pip install --python ~/rembg-env/bin/python "rembg[cpu,cli]"
+```
+
+The binary is auto-detected (`rembg_bin` param → `REMBG_BIN` env var →
+`~/rembg-env/bin/rembg` → `PATH`). First use of a model downloads it
+(~100–300 MB) to `~/.rembg`; subsequent runs take ~10–90 s.
+
+Pick the model for your subject:
+
+| Model | Best for |
+|---|---|
+| `bria-rmbg` *(default)* | **People** — best quality |
+| `u2net_human_seg` | People — coarser, faster |
+| `isnet-general-use` / `birefnet-general` | **Any object** (products, animals, vehicles…) |
+| `u2net` | General baseline |
+
+```
+"Remove the background from the open image"
+→ remove_background(image_index=0, model="bria-rmbg")
+→ cutout appears as top layer; original untouched
+```
+
 ### 🎨 Adjustments
 | Tool | Description |
 |---|---|
@@ -294,6 +327,7 @@ Lower-level bitmap fetch with region extraction and scaling. Returns base64-enco
 | `new_canvas` | Create blank canvas |
 | `close_image` | Close image |
 | `list_images` | List open images |
+| `remove_background` | **AI background removal** (local rembg/ONNX) — inserts cutout as new layer |
 
 ### 🔍 Info & Context
 | Tool | Description |

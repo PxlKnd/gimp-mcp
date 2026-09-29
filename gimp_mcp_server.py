@@ -7,6 +7,10 @@ import socket
 import json
 import logging
 import base64
+import os
+import shutil
+import subprocess
+import tempfile
 import traceback
 import time
 from pathlib import Path
@@ -601,6 +605,164 @@ def export_image(
     except Exception as e:
         traceback.print_exc()
         raise Exception(f"export_image failed: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# AI BACKGROUND REMOVAL — local rembg (ONNX) integration
+# ─────────────────────────────────────────────────────────────────────────
+
+# Well-known rembg models and what they are good at.
+# rembg downloads a model to ~/.rembg on first use (~100-300 MB).
+REMBG_MODELS = {
+    "bria-rmbg": "people — best quality (default)",
+    "u2net_human_seg": "people — coarser, faster",
+    "isnet-general-use": "any object (products, animals, vehicles...)",
+    "birefnet-general": "any object — high quality",
+    "birefnet-dis": "thin/complex structures",
+    "u2net": "general salient object — baseline",
+    "u2netp": "general — lightweight",
+    "silueta": "general salient object",
+}
+
+
+def _resolve_rembg_bin(rembg_bin: str = "") -> Path:
+    """Locate the rembg executable.
+
+    Priority: explicit param > REMBG_BIN env var > ~/rembg-env > PATH.
+    """
+    candidates = []
+    if rembg_bin:
+        candidates.append(Path(rembg_bin).expanduser())
+    env_bin = os.environ.get("REMBG_BIN")
+    if env_bin:
+        candidates.append(Path(env_bin).expanduser())
+    candidates.append(Path.home() / "rembg-env" / "bin" / "rembg")
+    found = shutil.which("rembg")
+    if found:
+        candidates.append(Path(found))
+    for c in candidates:
+        if c.is_file() and os.access(c, os.X_OK):
+            return c
+    raise Exception(
+        "rembg executable not found. One-time install:\n"
+        "  uv venv --python 3.13 ~/rembg-env\n"
+        '  uv pip install --python ~/rembg-env/bin/python "rembg[cpu,cli]"\n'
+        "Then retry, or pass rembg_bin=<path to the rembg binary>."
+    )
+
+
+@mcp.tool()
+def remove_background(
+    ctx: Context,
+    image_index: int = 0,
+    model: str = "bria-rmbg",
+    layer_name: str = "Freigestellt (KI)",
+    rembg_bin: str = "",
+) -> dict:
+    """Remove the background from an open image using local AI matting (rembg).
+
+    Exports the image's current visible state, runs the rembg CLI (ONNX, runs
+    fully on this machine) on it, and inserts the result as a new transparent
+    layer on top of the image. Non-destructive — original layers stay intact.
+
+    Requires a one-time install of rembg on this machine:
+        uv venv --python 3.13 ~/rembg-env
+        uv pip install --python ~/rembg-env/bin/python "rembg[cpu,cli]"
+
+    The binary is located via: rembg_bin param > REMBG_BIN env var >
+    ~/rembg-env/bin/rembg > PATH.
+
+    Model guide:
+    - "bria-rmbg" (default) — people, best quality
+    - "u2net_human_seg" — people, coarser
+    - "isnet-general-use" / "birefnet-general" — any objects
+    - "u2net" — general baseline
+    First use of a model downloads it (~100-300 MB) to ~/.rembg and can take
+    a few minutes; subsequent runs take ~10-90 s.
+
+    Parameters:
+    - image_index: which open image to process (default 0)
+    - model: rembg model name (default "bria-rmbg")
+    - layer_name: name for the new layer (default "Freigestellt (KI)")
+    - rembg_bin: optional explicit path to the rembg executable
+
+    Returns:
+    - status, layer_name, model, elapsed_seconds, size_bytes, note
+    """
+    t0 = time.time()
+    rembg_path = _resolve_rembg_bin(rembg_bin)
+
+    tmpdir = tempfile.mkdtemp(prefix="gimp-rembg-")
+    src_png = os.path.join(tmpdir, "input.png")
+    cut_png = os.path.join(tmpdir, "cutout.png")
+    try:
+        conn = get_gimp_connection()
+
+        # 1) Export the current visible state of the image. Large exports can
+        #    exceed the 10 s socket timeout yet still succeed — fall back to
+        #    checking whether the file was written.
+        export_ok = False
+        try:
+            result = conn.send_command("export_image", {
+                "file_path": src_png,
+                "format": "png",
+                "quality": 100,
+                "flatten": True,
+                "image_index": image_index,
+            })
+            export_ok = result.get("status") == "success"
+        except Exception as e:
+            logger.warning(f"export_image timed out ({e}) — checking file existence")
+        if not export_ok and not os.path.isfile(src_png):
+            raise Exception("could not export the image from GIMP — is an image open?")
+
+        # 2) Run local AI matting via the rembg CLI
+        proc = subprocess.run(
+            [str(rembg_path), "i", "-m", model, src_png, cut_png],
+            capture_output=True, text=True, timeout=900,
+        )
+        if proc.returncode != 0 or not os.path.isfile(cut_png):
+            tail = " | ".join((proc.stderr or proc.stdout or "").strip().splitlines()[-6:])
+            raise Exception(f"rembg failed (exit {proc.returncode}): {tail}")
+        size_bytes = os.path.getsize(cut_png)
+
+        # 3) Import the cutout as a new layer on top of the image.
+        #    Note: GIMP 3.2 silently ignores insert_layer() for layers from
+        #    other images, so we use the copy/paste route instead.
+        code = f"""\
+from gi.repository import Gimp, Gio
+_tgt = Gimp.get_images()[{int(image_index)}]
+_src = Gimp.file_load(Gimp.RunMode.NONINTERACTIVE, Gio.File.new_for_path({cut_png!r}))
+_sl = _src.get_layers()[0]
+Gimp.Selection.all(_src)
+Gimp.edit_copy([_sl])
+Gimp.Selection.none(_src)
+_lt = Gimp.ImageType.RGBA_IMAGE if _tgt.get_base_type() == Gimp.ImageBaseType.RGB else Gimp.ImageType.GRAYA_IMAGE
+_nl = Gimp.Layer.new(_tgt, {layer_name!r}, _tgt.get_width(), _tgt.get_height(), _lt, 100, Gimp.LayerMode.NORMAL)
+_tgt.insert_layer(_nl, None, 0)
+_fs = Gimp.edit_paste(_nl, True)[0]
+Gimp.floating_sel_anchor(_fs)
+Gimp.Selection.none(_tgt)
+Gimp.Image.delete(_src)
+Gimp.displays_flush()
+'imported'"""
+        result = conn.send_command("python-fu-exec", {"args": ["python-fu-exec", [code]]})
+        if result.get("status") != "success":
+            raise Exception(f"layer import failed: {result.get('error', 'unknown error')}")
+        outputs = result.get("results", [])
+        if outputs and "error" in str(outputs[0]).lower():
+            raise Exception(f"layer import failed: {outputs[0]}")
+
+        return {
+            "status": "success",
+            "layer_name": layer_name,
+            "model": model,
+            "elapsed_seconds": round(time.time() - t0, 1),
+            "size_bytes": size_bytes,
+            "note": "Cutout inserted as top layer. Toggle layer visibility to compare.",
+        }
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 @mcp.tool()
